@@ -8,7 +8,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from neo4j import DEFAULT_DATABASE, GraphDatabase, basic_auth
 from neo4j.exceptions import ClientError, SessionExpired
-from neo4j.graph import Node, Relationship
+from neo4j.graph import Node, Path, Relationship
 
 from neomodel import config, core
 from neomodel.exceptions import (
@@ -38,7 +38,9 @@ def ensure_connection(func):
 
 
 def change_neo4j_password(db, new_password):
-    db.cypher_query("CALL dbms.changePassword($password)", {"password": new_password})
+    db.cypher_query(
+        "CALL dbms.changePassword($password)", {"password": new_password}
+    )
 
 
 def clear_neo4j_database(db, clear_constraints=False, clear_indexes=False):
@@ -110,7 +112,10 @@ class Database(local, NodeClassRegistry):
             "neo4j+ssc",
         ]
 
-        if parsed_url.netloc.find("@") > -1 and parsed_url.scheme in valid_schemas:
+        if (
+            parsed_url.netloc.find("@") > -1
+            and parsed_url.scheme in valid_schemas
+        ):
             credentials, hostname = parsed_url.netloc.rsplit("@", 1)
             username, password = credentials.split(":")
             password = unquote(password)
@@ -142,7 +147,9 @@ class Database(local, NodeClassRegistry):
         self.url = url
         self._pid = os.getpid()
         self._active_transaction = None
-        self._database_name = DEFAULT_DATABASE if database_name == "" else database_name
+        self._database_name = (
+            DEFAULT_DATABASE if database_name == "" else database_name
+        )
 
     @property
     def transaction(self):
@@ -205,7 +212,40 @@ class Database(local, NodeClassRegistry):
             self._active_transaction = None
             self._session = None
 
-    def _object_resolution(self, result_list):
+    def _object_resolution(self, object_to_resolve):
+        # For some reason, while the type of `a_result_attribute[1]`
+        # as reported by the neo4j driver is `Node` for Node-type data
+        # retrieved from the database.
+        # When the retrieved data are Relationship-Type,
+        # the returned type is `abc.[REL_LABEL]` which is however
+        # a descendant of Relationship.
+        # Consequently, the type checking was changed for both
+        # Node, Relationship objects
+        if isinstance(object_to_resolve, Node):
+            return self._NODE_CLASS_REGISTRY[
+                frozenset(object_to_resolve.labels)
+            ].inflate(object_to_resolve)
+
+        if isinstance(object_to_resolve, Relationship):
+            return self._NODE_CLASS_REGISTRY[
+                frozenset([object_to_resolve.type])
+            ].inflate(object_to_resolve)
+
+        if isinstance(object_to_resolve, Path):
+            new_nodes = []
+            for node in object_to_resolve.nodes:
+                new_nodes.append(self._object_resolution(node))
+            new_relationships = []
+            for relationship in object_to_resolve.relationships:
+                new_rel = self._object_resolution(relationship)
+                print(new_rel)
+                new_relationships.append(new_rel)
+            return Path(new_nodes[0], new_relationships)
+
+        if isinstance(object_to_resolve, list):
+            return self._result_resolution([object_to_resolve])
+
+    def _result_resolution(self, result_list):
         """
         Performs in place automatic object resolution on a set of results
         returned by cypher_query.
@@ -228,28 +268,7 @@ class Database(local, NodeClassRegistry):
                     # Nodes to be resolved to native objects
                     resolved_object = a_result_attribute[1]
 
-                    # For some reason, while the type of `a_result_attribute[1]`
-                    # as reported by the neo4j driver is `Node` for Node-type data
-                    # retrieved from the database.
-                    # When the retrieved data are Relationship-Type,
-                    # the returned type is `abc.[REL_LABEL]` which is however
-                    # a descendant of Relationship.
-                    # Consequently, the type checking was changed for both
-                    # Node, Relationship objects
-                    if isinstance(a_result_attribute[1], Node):
-                        resolved_object = self._NODE_CLASS_REGISTRY[
-                            frozenset(a_result_attribute[1].labels)
-                        ].inflate(a_result_attribute[1])
-
-                    if isinstance(a_result_attribute[1], Relationship):
-                        resolved_object = self._NODE_CLASS_REGISTRY[
-                            frozenset([a_result_attribute[1].type])
-                        ].inflate(a_result_attribute[1])
-
-                    if isinstance(a_result_attribute[1], list):
-                        resolved_object = self._object_resolution(
-                            [a_result_attribute[1]]
-                        )
+                    resolved_object = self._object_resolution(resolved_object)
 
                     result_list[a_result_item[0]][
                         a_result_attribute[0]
@@ -307,12 +326,14 @@ class Database(local, NodeClassRegistry):
             # Retrieve the data
             start = time.time()
             response = session.run(query, params)
-            results, meta = [list(r.values()) for r in response], response.keys()
+            results, meta = [
+                list(r.values()) for r in response
+            ], response.keys()
             end = time.time()
 
             if resolve_objects:
                 # Do any automatic resolution required
-                results = self._object_resolution(results)
+                results = self._result_resolution(results)
 
         except ClientError as e:
             if e.code == "Neo.ClientError.Schema.ConstraintValidationFailed":
@@ -374,7 +395,10 @@ class TransactionProxy:
             self.db.rollback()
 
         if exc_type is ClientError:
-            if exc_value.code == "Neo.ClientError.Schema.ConstraintValidationFailed":
+            if (
+                exc_value.code
+                == "Neo.ClientError.Schema.ConstraintValidationFailed"
+            ):
                 raise UniqueProperty(exc_value.message)
 
         if not exc_value:
